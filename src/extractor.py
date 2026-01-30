@@ -31,6 +31,9 @@ REFERENCE_HEADERS = [
     r'\bBIBLIOGRAPHY\b',
 ]
 
+# Year pattern - matches 4 digit years from 1900-2099
+YEAR_PATTERN = re.compile(r'\b(19|20)\d{2}\b')
+
 
 @dataclass
 class ExtractedCitation:
@@ -38,6 +41,9 @@ class ExtractedCitation:
     number: int
     text: str
     doi: Optional[str] = None
+    title: Optional[str] = None
+    authors: Optional[list[str]] = None
+    year: Optional[int] = None
     raw_match: Optional[str] = None
     
     def to_dict(self) -> dict:
@@ -181,6 +187,78 @@ def extract_dois(text: str) -> list[str]:
     return cleaned
 
 
+def parse_citation_text(text: str) -> dict:
+    """
+    Parse a citation text to extract title, authors, and year.
+    
+    Handles common citation formats:
+    - APA: Author, A. A., & Author, B. B. (Year). Title. Journal.
+    - IEEE: A. Author and B. Author, "Title," Journal, Year.
+    - Nature: Author, A., Author, B. Title. Journal Year.
+    
+    Returns:
+        Dict with keys: title, authors (list), year (int or None)
+    """
+    result = {"title": None, "authors": [], "year": None}
+    
+    if not text:
+        return result
+    
+    # Clean up the text
+    text = re.sub(r'\s+', ' ', text.strip())
+    
+    # Extract year (look for 4-digit year)
+    year_matches = YEAR_PATTERN.findall(text)
+    if year_matches:
+        # Take the first year found (usually publication year)
+        result["year"] = int(year_matches[0])
+    
+    # Try to extract title - common patterns:
+    # 1. Quoted title: "Title here" or "Title here"
+    quoted_title = re.search(r'["""]([^"""]+)["""]', text)
+    if quoted_title:
+        result["title"] = quoted_title.group(1).strip()
+    else:
+        # 2. Title after year in parentheses: (2020). Title.
+        after_year = re.search(r'\(\d{4}\)\.\s*([^.]+(?:\.[^.]+)?)', text)
+        if after_year:
+            result["title"] = after_year.group(1).strip()
+        else:
+            # 3. Title is typically the longest sentence-like segment
+            # after the author portion (before journal/conference)
+            # Look for capitalized phrase that's not all caps
+            sentences = re.split(r'[.?!]\s+', text)
+            for sent in sentences:
+                # Title is usually longer and mixed case
+                if len(sent) > 30 and not sent.isupper():
+                    # Skip if it looks like author names (has commas and initials)
+                    if not re.match(r'^[A-Z][a-z]+,\s*[A-Z]\.', sent):
+                        result["title"] = sent.strip()
+                        break
+    
+    # Extract authors - usually at the start before year or title
+    # Look for patterns like: "Smith, J., Jones, A. B.," or "J. Smith, A. Jones"
+    author_section = text
+    if result["year"]:
+        # Authors are usually before the year
+        year_pos = text.find(str(result["year"]))
+        if year_pos > 10:
+            author_section = text[:year_pos]
+    
+    # Common author patterns
+    # Pattern: "Last, F., Last, F. M.," (multiple authors with initials)
+    author_pattern1 = re.findall(r'([A-Z][a-z]+,?\s+[A-Z]\.(?:\s*[A-Z]\.)?)', author_section)
+    # Pattern: "F. Last" or "First Last"
+    author_pattern2 = re.findall(r'([A-Z]\.?\s+[A-Z][a-z]+)', author_section)
+    
+    if author_pattern1:
+        result["authors"] = author_pattern1[:10]  # Limit to 10 authors
+    elif author_pattern2:
+        result["authors"] = author_pattern2[:10]
+    
+    return result
+
+
 def parse_numbered_citations(text: str) -> list[tuple[int, str]]:
     """
     Parse numbered citations from reference text.
@@ -259,7 +337,7 @@ def extract_citations(pdf_path: Union[str, Path]) -> ExtractionResult:
         citations = []
         
         if parsed_citations:
-            # Match DOIs to their citations
+            # Match DOIs to their citations and parse metadata
             for num, text in parsed_citations:
                 doi = None
                 # Check if any DOI is in this citation text
@@ -268,10 +346,16 @@ def extract_citations(pdf_path: Union[str, Path]) -> ExtractionResult:
                         doi = d
                         break
                 
+                # Parse title, authors, year from citation text
+                parsed = parse_citation_text(text)
+                
                 citations.append(ExtractedCitation(
                     number=num,
                     text=text[:500],  # Truncate long citations
                     doi=doi,
+                    title=parsed["title"],
+                    authors=parsed["authors"] if parsed["authors"] else None,
+                    year=parsed["year"],
                 ))
         else:
             # Couldn't parse numbered citations, just report DOIs
